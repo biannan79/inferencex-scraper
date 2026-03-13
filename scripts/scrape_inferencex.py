@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
 """
-InferenceX 数据采集脚本 - 从 Vercel Blob Storage 采集 LLM 推理性能基准数据
+InferenceX 数据采集脚本 v3 - 使用新的 /api/v1 端点采集 LLM 推理性能基准数据
 
-使用 subprocess + curl 作为 HTTP 客户端（避免 Python requests 库在某些环境中
-对 Vercel Blob Storage 的 SSL 连接存在挂起问题）。
+新 API 结构:
+  1. /api/v1/availability  → 返回所有可用的 model/hardware/framework/date 组合列表
+  2. /api/v1/benchmarks?model={display_name}&date={date} → 返回具体模型在指定日期的全部性能数据
+  3. /api/v1/workflow-info?date={date} → 返回工作流元数据
 
 数据流程:
-  1. 从 availability.json 获取可用的模型/日期索引
-  2. 为每个模型+序列组合找到匹配的 availability key
-  3. 获取最新日期的 e2e 和 interactivity 数据
-  4. 展平嵌套结构（{data: [...], gpus: [...]} → flat records）
-  5. 保存为标准化的 JSON 文件
+  1. 从 /api/v1/availability 获取所有可用组合
+  2. 从中提取唯一的 model+date 对
+  3. 调用 /api/v1/benchmarks 获取每个 model+date 的完整性能数据
+  4. 按模型保存为 JSON 文件
 """
 
 import subprocess
 import json
 import time
 import os
-import re
 import argparse
 from datetime import datetime
 from typing import Dict, List, Tuple, Optional, Set
@@ -25,21 +25,41 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# ─── 默认模型和序列配置 ───────────────────────────────────────────────────────
-DEFAULT_MODELS = [
-    "Llama 3.3 70B Instruct",
-    "gpt-oss 120B",
-    "DeepSeek R1 0528",
-    "Kimi K2.5",
-    "MiniMax M2.5",
-    "Qwen 3.5 397B-A17B",
-]
+# ─── API 配置 ──────────────────────────────────────────────────────────────────
+
+API_BASE_URL = "https://inferencex.semianalysis.com/api/v1"
+
+# ─── availability 中的 model ID → 网站上使用的 display name 映射 ────────────────
+# availability 返回的 model 字段是短 ID (如 "llama70b")
+# benchmarks API 需要的是 display name (如 "Llama-3.3-70B-Instruct-FP8")
+# 这个映射可以从网站的模型选择器中获取
+MODEL_DISPLAY_NAMES = {
+    "llama70b": "Llama-3.3-70B-Instruct-FP8",
+    "dsr1": "DeepSeek-R1-0528",
+    "gptoss120b": "gpt-oss-120B",
+    "kimik2.5": "Kimi-K2.5",
+    "minimaxm2.5": "MiniMax-M2.5",
+    "qwen3.5": "Qwen-3.5-397B-A17B",
+    "glm5": "GLM-5",
+}
+
+# 反向映射: display name → model ID
+DISPLAY_NAME_TO_ID = {v: k for k, v in MODEL_DISPLAY_NAMES.items()}
+
+# 用户友好名称 → model ID 映射
+USER_FRIENDLY_NAMES = {
+    "Llama 3.3 70B Instruct": "llama70b",
+    "gpt-oss 120B": "gptoss120b",
+    "DeepSeek R1 0528": "dsr1",
+    "Kimi K2.5": "kimik2.5",
+    "MiniMax M2.5": "minimaxm2.5",
+    "Qwen 3.5 397B-A17B": "qwen3.5",
+    "GLM 5": "glm5",
+}
+
+DEFAULT_MODELS = list(MODEL_DISPLAY_NAMES.keys())  # 默认采集所有已知模型
 
 DEFAULT_SEQUENCES = ["1K / 1K", "1K / 8K", "8K / 1K"]
-
-BLOB_STORAGE_BASE_URL = (
-    "https://yig6saydz8oscerh.public.blob.vercel-storage.com/historical-data-prod-v9"
-)
 
 
 # ─── 工具函数 ─────────────────────────────────────────────────────────────────
@@ -65,7 +85,6 @@ def curl_fetch(url: str, timeout: int = 120) -> Tuple[Optional[str], int]:
             logger.error(f"curl failed with exit code {result.returncode}: {result.stderr}")
             return None, 0
 
-        # 分离响应体和 HTTP 状态码
         output = result.stdout
         if '__HTTP_CODE__' in output:
             parts = output.rsplit('\n__HTTP_CODE__', 1)
@@ -73,7 +92,7 @@ def curl_fetch(url: str, timeout: int = 120) -> Tuple[Optional[str], int]:
             http_code = int(parts[1].strip()) if len(parts) > 1 else 0
         else:
             body = output
-            http_code = 200  # 假设成功
+            http_code = 200
 
         return body, http_code
 
@@ -85,248 +104,228 @@ def curl_fetch(url: str, timeout: int = 120) -> Tuple[Optional[str], int]:
         return None, 0
 
 
+def seq_to_isl_osl(sequence: str) -> Tuple[int, int]:
+    """将序列格式转换为 isl/osl 数值: '1K / 8K' -> (1024, 8192)"""
+    seq = sequence.lower().replace(' ', '')
+    parts = seq.split('/')
+    if len(parts) != 2:
+        return 0, 0
+
+    def parse_k(s):
+        s = s.strip().lower()
+        if s.endswith('k'):
+            return int(s[:-1]) * 1024
+        return int(s)
+
+    return parse_k(parts[0]), parse_k(parts[1])
+
+
 # ─── 数据采集器 ───────────────────────────────────────────────────────────────
 
 class APIDataCollector:
-    """API数据采集器 - 适配新的 Vercel Blob Storage 架构"""
+    """API数据采集器 - 适配新的 /api/v1 端点"""
 
-    def __init__(self, base_url: str = BLOB_STORAGE_BASE_URL, timeout: int = 120):
+    def __init__(self, base_url: str = API_BASE_URL, timeout: int = 120):
         self.base_url = base_url
         self.timeout = timeout
         self.availability = None  # 缓存 availability 数据
 
-    def fetch_availability(self) -> Dict:
-        """获取 availability.json 索引，包含所有可用的模型/日期映射"""
+    def fetch_availability(self) -> List[Dict]:
+        """获取 /api/v1/availability，返回所有可用的配置组合列表"""
         if self.availability is not None:
             return self.availability
 
-        url = f"{self.base_url}/availability.json"
-        logger.info(f"Fetching availability index: {url}")
+        url = f"{self.base_url}/availability"
+        logger.info(f"Fetching availability: {url}")
 
         body, status = curl_fetch(url, timeout=60)
         if status == 200 and body:
             try:
                 self.availability = json.loads(body)
-                logger.info(f"Availability index loaded: {len(self.availability)} keys")
+                logger.info(f"Availability loaded: {len(self.availability)} entries")
                 return self.availability
             except json.JSONDecodeError as e:
                 logger.error(f"Failed to parse availability JSON: {e}")
-                return {}
+                return []
         else:
             logger.error(f"Failed to fetch availability: HTTP {status}")
-            return {}
-
-    def normalize_model_name(self, model: str) -> str:
-        """标准化模型名称用于匹配 availability key"""
-        normalized = model.lower().replace(' ', '-')
-        # 处理版本号中的点: 3.3 -> 3_3, 2.5 -> 2_5, 3.5 -> 3_5
-        normalized = re.sub(r'(\d+)\.(\d+)', r'\1_\2', normalized)
-        return normalized
-
-    def normalize_sequence(self, sequence: str) -> str:
-        """标准化序列名称: '1K / 1K' -> '1k_1k'"""
-        return sequence.lower().replace(' ', '').replace('/', '_')
-
-    def find_availability_key(self, model: str, sequence: str) -> Optional[str]:
-        """
-        在 availability.json 中查找匹配的基础 key
-        基础 key 是不包含硬件和精度后缀的最短匹配 key
-        例如: deepseek-r1-0528-1k_1k (不是 deepseek-r1-0528-1k_1k-fp8-b200_trt)
-        """
-        availability = self.fetch_availability()
-        if not availability:
-            return None
-
-        model_id = self.normalize_model_name(model)
-        seq_id = self.normalize_sequence(sequence)
-
-        # 策略1: 找以 model_id-seq_id 结尾的 key（最基础的 key）
-        candidates = []
-        for key in availability.keys():
-            key_lower = key.lower()
-            # 检查 key 是否以 seq_id 结尾且包含模型名
-            if model_id in key_lower and key_lower.endswith(seq_id):
-                candidates.append(key)
-
-        if candidates:
-            # 选最短的（最基础的 key，没有精度/硬件后缀）
-            candidates.sort(key=lambda x: len(x))
-            chosen = candidates[0]
-            logger.info(f"Found availability key: '{chosen}' for model='{model}', seq='{sequence}'")
-            return chosen
-
-        # 策略2: 尝试常见的 key 模式
-        possible_keys = [
-            f"{model_id}-{seq_id}",
-            f"{model_id}-fp8-{seq_id}",
-            f"{model_id}-fp4-{seq_id}",
-        ]
-        for pk in possible_keys:
-            if pk in availability:
-                logger.info(f"Found availability key (pattern match): '{pk}' for model='{model}', seq='{sequence}'")
-                return pk
-
-        # 最后: 列出所有含模型名的 key，帮助调试
-        model_keys = [k for k in availability.keys() if model_id in k.lower()]
-        if model_keys:
-            logger.warning(f"No exact match for model='{model}', seq='{sequence}'. "
-                         f"Available keys with this model ({len(model_keys)}): {model_keys[:10]}")
-        else:
-            logger.warning(f"No availability keys found for model='{model}' (normalized: '{model_id}')")
-
-        return None
-
-    def get_latest_date(self, availability_key: str) -> Optional[str]:
-        """获取指定 availability key 的最新日期"""
-        availability = self.fetch_availability()
-        if not availability or availability_key not in availability:
-            return None
-
-        dates = availability[availability_key]
-        if not dates:
-            return None
-
-        return sorted(dates)[-1]
-
-    def get_all_dates(self, availability_key: str) -> List[str]:
-        """获取指定 availability key 的所有可用日期"""
-        availability = self.fetch_availability()
-        if not availability or availability_key not in availability:
-            return []
-        return sorted(availability[availability_key])
-
-    def flatten_data(self, raw_data) -> List[Dict]:
-        """
-        将 API 返回的嵌套数据结构展平为平坦的记录列表。
-
-        新 API 返回格式: [{"data": [...records...], "gpus": [...]}]
-        旧 API 返回格式: [...records...] (每个 record 直接含 hwKey, conc 等)
-        """
-        if not raw_data:
             return []
 
-        flat_records = []
+    def get_available_models(self) -> Set[str]:
+        """获取所有可用的 model ID"""
+        avail = self.fetch_availability()
+        return set(item.get('model', '') for item in avail if item.get('model'))
 
-        if isinstance(raw_data, list):
-            for item in raw_data:
-                if isinstance(item, dict):
-                    # 新格式: {"data": [...], "gpus": [...]}
-                    if 'data' in item and isinstance(item['data'], list):
-                        flat_records.extend(item['data'])
-                    # 旧格式: 直接就是 record
-                    elif 'hwKey' in item or 'hw' in item:
-                        flat_records.append(item)
-                    else:
-                        # 未知格式，尝试作为记录添加
-                        flat_records.append(item)
-        elif isinstance(raw_data, dict):
-            if 'data' in raw_data and isinstance(raw_data['data'], list):
-                flat_records.extend(raw_data['data'])
-            else:
-                flat_records.append(raw_data)
+    def get_available_dates(self, model_id: str = None) -> List[str]:
+        """获取所有可用日期（可选按模型过滤）"""
+        avail = self.fetch_availability()
+        dates = set()
+        for item in avail:
+            if model_id and item.get('model') != model_id:
+                continue
+            date = item.get('date', '')
+            if date:
+                dates.add(date)
+        return sorted(dates)
 
-        return flat_records
+    def get_latest_date(self, model_id: str = None) -> Optional[str]:
+        """获取最新的可用日期"""
+        dates = self.get_available_dates(model_id)
+        return dates[-1] if dates else None
 
-    def fetch_data(self, availability_key: str, date: str, data_type: str) -> Tuple[Optional[List], bool, str]:
+    def get_model_display_name(self, model_id: str) -> str:
+        """获取模型的 display name（用于 benchmarks API）"""
+        return MODEL_DISPLAY_NAMES.get(model_id, model_id)
+
+    def resolve_model_id(self, model_name: str) -> str:
+        """将用户输入的模型名称解析为 model ID"""
+        # 先检查是否已经是 model ID
+        if model_name in MODEL_DISPLAY_NAMES:
+            return model_name
+        # 检查用户友好名称
+        if model_name in USER_FRIENDLY_NAMES:
+            return USER_FRIENDLY_NAMES[model_name]
+        # 检查 display name
+        if model_name in DISPLAY_NAME_TO_ID:
+            return DISPLAY_NAME_TO_ID[model_name]
+        # 尝试模糊匹配
+        model_lower = model_name.lower()
+        for uid, mid in USER_FRIENDLY_NAMES.items():
+            if model_lower in uid.lower() or uid.lower() in model_lower:
+                return mid
+        # 原样返回
+        return model_name
+
+    def fetch_benchmarks(self, model_id: str, date: str) -> Tuple[Optional[List], str]:
         """
-        获取指定日期和类型的数据，并展平嵌套结构
+        获取指定模型在指定日期的全部 benchmark 数据
 
         Args:
-            availability_key: availability.json 中的 key
-            date: 日期字符串, 如 '2026-02-25'
-            data_type: 'e2e' 或 'interactivity'
+            model_id: 模型 ID (如 'llama70b')
+            date: 日期 (如 '2025-10-29')
 
         Returns:
-            (data, success, url) - data 是展平后的记录列表
+            (data_list, url) - data 是包含所有指标的记录列表
         """
-        url = f"{self.base_url}/{date}/{availability_key}-{data_type}.json"
+        display_name = self.get_model_display_name(model_id)
+        url = f"{self.base_url}/benchmarks?model={display_name}&date={date}"
 
+        logger.info(f"Fetching benchmarks: {url}")
         body, status = curl_fetch(url, timeout=self.timeout)
 
         if status == 200 and body:
             try:
-                raw_data = json.loads(body)
-                # 展平嵌套结构
-                flat_records = self.flatten_data(raw_data)
-                if flat_records:
-                    return flat_records, True, url
+                data = json.loads(body)
+                if isinstance(data, dict) and 'error' in data:
+                    logger.error(f"API error for {model_id}: {data['error']}")
+                    return None, url
+                if isinstance(data, list):
+                    return data, url
                 else:
-                    logger.warning(f"No records found after flattening data from {url}")
-                    return None, False, url
+                    logger.warning(f"Unexpected response type for {url}: {type(data)}")
+                    return None, url
             except json.JSONDecodeError as e:
                 logger.error(f"JSON parse error for {url}: {e}")
-                return None, False, url
+                return None, url
         else:
-            logger.warning(f"HTTP {status} for {url}")
-            return None, False, url
+            logger.error(f"HTTP {status} for {url}")
+            return None, url
+
+    def filter_by_sequence(self, data: List[Dict], sequences: List[str] = None) -> Dict[str, List[Dict]]:
+        """
+        按序列长度过滤数据
+
+        Returns:
+            字典: {sequence_key: [records]}
+        """
+        if sequences is None:
+            sequences = DEFAULT_SEQUENCES
+
+        result = {}
+        for seq in sequences:
+            isl, osl = seq_to_isl_osl(seq)
+            seq_key = f"{isl}_{osl}"
+            seq_data = [
+                record for record in data
+                if record.get('isl') == isl and record.get('osl') == osl
+            ]
+            if seq_data:
+                result[seq_key] = seq_data
+
+        return result
 
     def analyze_data(self, data: List[Dict]) -> Dict:
         """分析数据统计信息"""
         if not data:
             return {
                 'record_count': 0,
-                'hwkeys': set(),
-                'b200_trt_count': 0,
-                'has_b200_trt': False,
+                'hardware': set(),
+                'frameworks': set(),
                 'precisions': set(),
+                'conc_levels': set(),
+                'sequences': set(),
             }
 
-        hwkeys = set()
+        hardware = set()
+        frameworks = set()
         precisions = set()
-        b200_trt_count = 0
+        conc_levels = set()
+        sequences = set()
 
         for item in data:
-            hwkey = str(item.get('hwKey', ''))
-            hwkeys.add(hwkey)
-            if 'b200_trt' in hwkey.lower():
-                b200_trt_count += 1
-
-            precision = str(item.get('precision', ''))
-            if precision:
-                precisions.add(precision)
+            hw = str(item.get('hardware', ''))
+            if hw:
+                hardware.add(hw)
+            fw = str(item.get('framework', ''))
+            if fw:
+                frameworks.add(fw)
+            prec = str(item.get('precision', ''))
+            if prec:
+                precisions.add(prec)
+            conc = item.get('conc')
+            if conc is not None:
+                conc_levels.add(conc)
+            isl = item.get('isl')
+            osl = item.get('osl')
+            if isl is not None and osl is not None:
+                sequences.add(f"{isl}_{osl}")
 
         return {
             'record_count': len(data),
-            'hwkeys': hwkeys,
-            'b200_trt_count': b200_trt_count,
-            'has_b200_trt': b200_trt_count > 0,
+            'hardware': hardware,
+            'frameworks': frameworks,
             'precisions': precisions,
+            'conc_levels': conc_levels,
+            'sequences': sequences,
         }
 
-    def save_json_file(self, data: List[Dict], model: str, sequence: str, data_type: str,
-                      output_dir: str, response_index: int = 1,
-                      availability_key: str = '', date: str = '', url: str = '') -> str:
+    def save_json_file(self, data: List[Dict], model_id: str,
+                       output_dir: str, date: str = '', url: str = '',
+                       response_index: int = 1) -> str:
         """保存JSON文件"""
         os.makedirs(output_dir, exist_ok=True)
 
-        model_safe = model.replace(' ', '_').replace('.', '_')
-        sequence_safe = sequence.replace(' ', '_').replace('/', '___')
-
-        filename = f"{response_index:02d}_{model_safe}_{sequence_safe}_{data_type}.json"
+        display_name = self.get_model_display_name(model_id)
+        filename = f"{response_index:02d}_{model_id}_benchmarks.json"
         filepath = os.path.join(output_dir, filename)
 
-        # 分析数据
         analysis = self.analyze_data(data)
 
         file_data = {
             'metadata': {
                 'combination_index': response_index,
-                'model': model,
-                'sequence': sequence,
-                'response_index': response_index,
+                'model_id': model_id,
+                'model_display_name': display_name,
                 'timestamp': datetime.now().isoformat(),
-                'request_id': response_index,
                 'url': url,
-                'availability_key': availability_key,
                 'data_date': date,
-                'method': 'GET',
-                'content_type': 'application/json',
-                'data_size': len(json.dumps(data)),
-                'data_type': data_type,
+                'api_version': 'v3-api-v1',
                 'record_count': analysis['record_count'],
-                'b200_trt_count': analysis['b200_trt_count'],
-                'hwkeys': sorted(list(analysis['hwkeys'])),
+                'hardware': sorted(list(analysis['hardware'])),
+                'frameworks': sorted(list(analysis['frameworks'])),
                 'precisions': sorted(list(analysis['precisions'])),
+                'conc_levels': sorted(list(analysis['conc_levels'])),
+                'sequences': sorted(list(analysis['sequences'])),
             },
             'data': data
         }
@@ -334,14 +333,12 @@ class APIDataCollector:
         with open(filepath, 'w', encoding='utf-8') as f:
             json.dump(file_data, f, indent=2, ensure_ascii=False)
 
-        logger.info(f"Saved: {filename} ({analysis['record_count']} records, "
-                    f"{analysis['b200_trt_count']} b200_trt, date={date})")
+        logger.info(f"Saved: {filename} ({analysis['record_count']} records, date={date})")
         return filepath
 
-    def collect_all_data(self, models: List[str], sequences: List[str],
-                        output_dir: str) -> Dict:
+    def collect_all_data(self, model_ids: List[str], sequences: List[str],
+                         output_dir: str, date: str = None) -> Dict:
         """采集所有数据"""
-        # 首先获取 availability 索引
         print("📥 Fetching availability index...")
         availability = self.fetch_availability()
         if not availability:
@@ -351,187 +348,159 @@ class APIDataCollector:
                 'failed_collections': [],
                 'total_files': 0,
                 'total_records': 0,
-                'total_b200_trt': 0,
                 'model_stats': {},
                 'error': 'Failed to fetch availability index'
             }
 
-        print(f"✅ Availability index loaded: {len(availability)} data keys")
+        available_models = self.get_available_models()
+        print(f"✅ Availability loaded: {len(availability)} entries, "
+              f"{len(available_models)} unique models: {sorted(available_models)}")
 
-        data_types = ["e2e", "interactivity"]
         results = {
             'successful_collections': [],
             'failed_collections': [],
             'total_files': 0,
             'total_records': 0,
-            'total_b200_trt': 0,
             'model_stats': {},
-            'availability_keys_total': len(availability),
+            'availability_entries': len(availability),
+            'available_models': sorted(available_models),
         }
 
         response_index = 1
 
-        for model in models:
-            model_stats = {
-                'files': 0,
-                'records': 0,
-                'b200_trt': 0,
-                'hwkeys': set(),
-                'successful_combinations': 0,
-                'dates_used': set(),
-            }
+        for model_id in model_ids:
+            # 确认模型在 availability 中存在
+            if model_id not in available_models:
+                print(f"\n❌ Model '{model_id}' not found in availability. "
+                      f"Available: {sorted(available_models)}")
+                results['failed_collections'].append({
+                    'model_id': model_id,
+                    'error': 'Model not in availability',
+                })
+                continue
 
-            for sequence in sequences:
-                combination_data = {
-                    'model': model,
-                    'sequence': sequence,
-                    'data_types': {},
-                    'timestamp': datetime.now().isoformat(),
+            # 确定日期
+            target_date = date or self.get_latest_date(model_id)
+            if not target_date:
+                print(f"\n❌ No dates available for {model_id}")
+                results['failed_collections'].append({
+                    'model_id': model_id,
+                    'error': 'No dates available',
+                })
+                continue
+
+            display_name = self.get_model_display_name(model_id)
+            print(f"\n📊 Collecting {display_name} (id={model_id}) [date: {target_date}]...")
+
+            # 获取 benchmarks 数据
+            data, url = self.fetch_benchmarks(model_id, target_date)
+
+            if data:
+                # 过滤序列（可选）
+                seq_data = self.filter_by_sequence(data, sequences)
+                filtered_data = []
+                for seq_key, records in seq_data.items():
+                    filtered_data.extend(records)
+
+                # 如果有序列过滤，用过滤后的数据；否则用全部数据
+                save_data = filtered_data if filtered_data else data
+
+                # 保存
+                filepath = self.save_json_file(
+                    save_data, model_id, output_dir,
+                    date=target_date, url=url,
+                    response_index=response_index
+                )
+
+                analysis = self.analyze_data(save_data)
+                model_stats = {
+                    'files': 1,
+                    'records': analysis['record_count'],
+                    'hardware': sorted(list(analysis['hardware'])),
+                    'frameworks': sorted(list(analysis['frameworks'])),
+                    'precisions': sorted(list(analysis['precisions'])),
+                    'conc_levels': sorted(list(analysis['conc_levels'])),
+                    'sequences': sorted(list(analysis['sequences'])),
+                    'date': target_date,
                 }
+                results['model_stats'][model_id] = model_stats
+                results['total_files'] += 1
+                results['total_records'] += analysis['record_count']
+                results['successful_collections'].append({
+                    'model_id': model_id,
+                    'display_name': display_name,
+                    'date': target_date,
+                    'record_count': analysis['record_count'],
+                    'filepath': filepath,
+                    'url': url,
+                })
 
-                # 查找 availability key
-                avail_key = self.find_availability_key(model, sequence)
-                if not avail_key:
-                    print(f"\n❌ No availability key found for {model} + {sequence}")
-                    combination_data['data_types'] = {
-                        dt: {'success': False, 'error': 'No availability key found'}
-                        for dt in data_types
-                    }
-                    results['failed_collections'].append(combination_data)
-                    response_index += 1
-                    continue
+                print(f"✅ Success: {analysis['record_count']} records, "
+                      f"HW: {sorted(list(analysis['hardware']))}, "
+                      f"Seq: {sorted(list(analysis['sequences']))}")
+            else:
+                print(f"❌ Failed to fetch benchmarks for {display_name}")
+                results['failed_collections'].append({
+                    'model_id': model_id,
+                    'display_name': display_name,
+                    'date': target_date,
+                    'error': f'Failed to fetch from {url}',
+                })
 
-                # 获取最新日期
-                latest_date = self.get_latest_date(avail_key)
-                if not latest_date:
-                    print(f"\n❌ No dates available for {model} + {sequence} (key: {avail_key})")
-                    combination_data['data_types'] = {
-                        dt: {'success': False, 'error': 'No dates available'}
-                        for dt in data_types
-                    }
-                    results['failed_collections'].append(combination_data)
-                    response_index += 1
-                    continue
-
-                combination_data['availability_key'] = avail_key
-                combination_data['data_date'] = latest_date
-                combination_data['available_dates'] = len(self.get_all_dates(avail_key))
-
-                combination_success = False
-
-                for data_type in data_types:
-                    print(f"\n📊 Collecting {model} + {sequence} ({data_type}) [date: {latest_date}]...")
-
-                    data, success, url = self.fetch_data(avail_key, latest_date, data_type)
-
-                    if success and data:
-                        try:
-                            # 保存文件
-                            filepath = self.save_json_file(
-                                data, model, sequence, data_type,
-                                output_dir, response_index,
-                                availability_key=avail_key,
-                                date=latest_date, url=url
-                            )
-
-                            # 分析数据
-                            analysis = self.analyze_data(data)
-
-                            # 更新统计
-                            model_stats['files'] += 1
-                            model_stats['records'] += analysis['record_count']
-                            model_stats['b200_trt'] += analysis['b200_trt_count']
-                            model_stats['hwkeys'].update(analysis['hwkeys'])
-                            model_stats['dates_used'].add(latest_date)
-
-                            results['total_files'] += 1
-                            results['total_records'] += analysis['record_count']
-                            results['total_b200_trt'] += analysis['b200_trt_count']
-
-                            combination_data['data_types'][data_type] = {
-                                'success': True,
-                                'record_count': analysis['record_count'],
-                                'b200_trt_count': analysis['b200_trt_count'],
-                                'hwkeys': sorted(list(analysis['hwkeys'])),
-                                'precisions': sorted(list(analysis['precisions'])),
-                                'filepath': filepath,
-                                'url': url,
-                                'date': latest_date,
-                            }
-
-                            combination_success = True
-                            print(f"✅ Success: {analysis['record_count']} records, "
-                                  f"{analysis['b200_trt_count']} b200_trt, "
-                                  f"HW: {sorted(list(analysis['hwkeys']))}")
-
-                        except Exception as e:
-                            print(f"❌ Failed to save file: {str(e)}")
-                            logger.error(f"Save error: {e}", exc_info=True)
-                            combination_data['data_types'][data_type] = {
-                                'success': False,
-                                'error': str(e)
-                            }
-                    else:
-                        print(f"❌ Failed to fetch data from {url}")
-                        combination_data['data_types'][data_type] = {
-                            'success': False,
-                            'error': f'Failed to fetch data from {url}'
-                        }
-
-                    time.sleep(0.3)  # 短暂延迟
-
-                if combination_success:
-                    model_stats['successful_combinations'] += 1
-                    results['successful_collections'].append(combination_data)
-                else:
-                    results['failed_collections'].append(combination_data)
-
-                response_index += 1
-
-            # 转换 set 为 list 以便 JSON 序列化
-            model_stats['hwkeys'] = sorted(list(model_stats['hwkeys']))
-            model_stats['dates_used'] = sorted(list(model_stats['dates_used']))
-            results['model_stats'][model] = model_stats
+            response_index += 1
+            time.sleep(0.5)
 
         return results
 
 
 # ─── 入口函数 ─────────────────────────────────────────────────────────────────
 
-def scrape_api_data(models: List[str], sequences: List[str],
+def scrape_api_data(models: List[str] = None, sequences: List[str] = None,
                     output_dir: str = "json_data/raw_json_files",
-                    timeout: int = 120) -> Dict:
+                    timeout: int = 120, date: str = None) -> Dict:
     """
-    使用新 API 方法采集数据的入口函数
+    采集 InferenceX 性能数据的入口函数
 
     Args:
-        models: 模型列表
-        sequences: 序列长度列表
+        models: 模型列表（可以是 model ID、display name 或用户友好名称）
+        sequences: 序列长度列表 (如 ["1K / 1K", "1K / 8K", "8K / 1K"])
         output_dir: 输出目录
         timeout: 请求超时时间（秒）
+        date: 指定日期采集（None=最新日期）
 
     Returns:
         采集结果字典
     """
-    print("🚀 Starting InferenceX data collection (Vercel Blob Storage API)...")
-    print(f"📋 Target: {len(models)} models × {len(sequences)} sequences = {len(models) * len(sequences)} combinations")
-    print(f"📁 Output directory: {output_dir}")
-
-    # 确保输出目录存在
-    os.makedirs(output_dir, exist_ok=True)
+    # 默认值
+    if models is None:
+        models = DEFAULT_MODELS
+    if sequences is None:
+        sequences = DEFAULT_SEQUENCES
 
     # 创建采集器
     collector = APIDataCollector(timeout=timeout)
 
+    # 解析模型名称
+    model_ids = [collector.resolve_model_id(m) for m in models]
+
+    print("🚀 Starting InferenceX data collection (API v1)...")
+    print(f"📋 Target models: {model_ids}")
+    print(f"📋 Target sequences: {sequences}")
+    print(f"📁 Output directory: {output_dir}")
+    if date:
+        print(f"📅 Target date: {date}")
+
+    os.makedirs(output_dir, exist_ok=True)
+
     # 开始采集
     start_time = time.time()
-    results = collector.collect_all_data(models, sequences, output_dir)
+    results = collector.collect_all_data(model_ids, sequences, output_dir, date)
     elapsed_time = time.time() - start_time
 
     # 更新统计
     results['elapsed_time'] = elapsed_time
     results['timestamp'] = datetime.now().isoformat()
-    results['api_version'] = 'v2-vercel-blob'
+    results['api_version'] = 'v3-api-v1'
     results['base_url'] = collector.base_url
 
     # 打印结果
@@ -541,18 +510,20 @@ def scrape_api_data(models: List[str], sequences: List[str],
     print(f"Elapsed time: {elapsed_time:.1f} seconds")
     print(f"Total files: {results['total_files']}")
     print(f"Total records: {results['total_records']}")
-    print(f"Total b200_trt data: {results['total_b200_trt']}")
-    print(f"Successful combinations: {len(results['successful_collections'])}")
-    print(f"Failed combinations: {len(results['failed_collections'])}")
+    print(f"Successful models: {len(results['successful_collections'])}")
+    print(f"Failed models: {len(results['failed_collections'])}")
 
     print(f"\n📊 Model Details:")
-    for model, stats in results['model_stats'].items():
-        print(f"\n🔸 {model}:")
-        print(f"  Files: {stats['files']}")
+    for model_id, stats in results['model_stats'].items():
+        display_name = MODEL_DISPLAY_NAMES.get(model_id, model_id)
+        print(f"\n🔸 {display_name} ({model_id}):")
         print(f"  Records: {stats['records']}")
-        print(f"  b200_trt: {stats['b200_trt']} ({'✅' if stats['b200_trt'] > 0 else '❌'})")
-        print(f"  Hardware: {stats['hwkeys']}")
-        print(f"  Dates used: {stats['dates_used']}")
+        print(f"  Hardware: {stats['hardware']}")
+        print(f"  Frameworks: {stats['frameworks']}")
+        print(f"  Precisions: {stats['precisions']}")
+        print(f"  Concurrency levels: {stats['conc_levels']}")
+        print(f"  Sequences: {stats['sequences']}")
+        print(f"  Date: {stats['date']}")
 
     # 保存总结报告
     summary_file = os.path.join(output_dir, 'api_scraping_summary.json')
@@ -568,7 +539,7 @@ def scrape_api_data(models: List[str], sequences: List[str],
 
 def main():
     parser = argparse.ArgumentParser(
-        description="InferenceX 推理性能数据采集 (Vercel Blob Storage API)"
+        description="InferenceX 推理性能数据采集 (API v1)"
     )
     parser.add_argument(
         '--output-dir', '-o',
@@ -578,12 +549,17 @@ def main():
     parser.add_argument(
         '--models', '-m',
         default=None,
-        help='逗号分隔的模型列表 (默认: 使用内置列表)'
+        help='逗号分隔的模型列表 (默认: 所有已知模型)'
     )
     parser.add_argument(
         '--sequences', '-s',
         default=None,
         help='逗号分隔的序列列表 (默认: "1K / 1K,1K / 8K,8K / 1K")'
+    )
+    parser.add_argument(
+        '--date', '-d',
+        default=None,
+        help='指定采集日期 (如 2025-10-29)，不指定则采集最新数据'
     )
     parser.add_argument(
         '--timeout', '-t',
@@ -598,20 +574,14 @@ def main():
 
     args = parser.parse_args()
 
-    # 设置日志
     log_level = logging.DEBUG if args.verbose else logging.INFO
     logging.basicConfig(level=log_level, format='%(asctime)s - %(levelname)s - %(message)s')
 
-    # 解析模型列表
-    models = [m.strip() for m in args.models.split(',')] if args.models else DEFAULT_MODELS
+    models = [m.strip() for m in args.models.split(',')] if args.models else None
+    sequences = [s.strip() for s in args.sequences.split(',')] if args.sequences else None
 
-    # 解析序列列表
-    sequences = [s.strip() for s in args.sequences.split(',')] if args.sequences else DEFAULT_SEQUENCES
+    results = scrape_api_data(models, sequences, args.output_dir, args.timeout, args.date)
 
-    # 执行采集
-    results = scrape_api_data(models, sequences, args.output_dir, args.timeout)
-
-    # 退出码
     if results.get('total_files', 0) > 0:
         exit(0)
     else:

@@ -1,180 +1,196 @@
 #!/usr/bin/env python3
 """
-CSV 合并脚本 - 将 E2E 和 Interactivity 两个 CSV 文件基于复合键 JOIN 合并
+CSV 合并脚本 v3 - 合并多个 benchmark CSV 文件或直接处理单一 CSV
 
-Join 键: model_name, sequence_length, conc, hwKey, precision, tp
-合并后新增列: e2e_x, e2e_y, inter_x, inter_y
+新版 API 已经在 benchmarks 端点返回了综合数据（包含所有 metrics），
+所以不再需要合并 e2e 和 interactivity 两个文件。
+
+本脚本的功能:
+  1. 如果只有一个 CSV 文件，直接复制为最终输出
+  2. 如果有多个 CSV 文件，按 composite key 合并
+  3. 支持向后兼容旧版的 e2e + interactivity 合并模式
 """
 
 import csv
 import os
 import argparse
-from collections import defaultdict
 from datetime import datetime
 
 
-def read_csv_file(filepath):
-    """读取CSV文件并返回字典数据"""
-    data = []
-    try:
-        with open(filepath, 'r', encoding='utf-8') as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                data.append(row)
-        return data
-    except Exception as e:
-        print(f"Error reading {filepath}: {e}")
-        return []
+def merge_or_copy_csv(input_dir: str, output_file: str) -> dict:
+    """
+    合并或复制 CSV 文件
+
+    Args:
+        input_dir: 输入目录
+        output_file: 输出文件路径
+
+    Returns:
+        统计信息字典
+    """
+    # 查找 CSV 文件
+    csv_files = []
+    for f in os.listdir(input_dir):
+        if f.endswith('.csv') and not f.startswith('inference_max_merged'):
+            csv_files.append(os.path.join(input_dir, f))
+
+    if not csv_files:
+        print("❌ No CSV files found in input directory")
+        return None
+
+    print(f"📊 Found {len(csv_files)} CSV file(s)")
+
+    # 检查是否有旧版的 e2e + interactivity 文件
+    e2e_file = os.path.join(input_dir, 'inference_max_e2e.csv')
+    inter_file = os.path.join(input_dir, 'inference_max_interactivity.csv')
+    benchmarks_file = os.path.join(input_dir, 'inference_max_benchmarks.csv')
+
+    if os.path.exists(benchmarks_file):
+        # 新版: 单一 benchmarks CSV，直接复制
+        print(f"📄 Using new unified benchmarks CSV: {benchmarks_file}")
+        return copy_csv(benchmarks_file, output_file)
+    elif os.path.exists(e2e_file) and os.path.exists(inter_file):
+        # 旧版: 合并 e2e + interactivity
+        print(f"📄 Using legacy e2e + interactivity CSVs")
+        return merge_legacy_csvs(e2e_file, inter_file, output_file)
+    elif len(csv_files) == 1:
+        # 只有一个 CSV 文件
+        print(f"📄 Single CSV file found: {csv_files[0]}")
+        return copy_csv(csv_files[0], output_file)
+    else:
+        # 多个 CSV 文件，简单合并
+        print(f"📄 Merging {len(csv_files)} CSV files...")
+        return merge_multiple_csvs(csv_files, output_file)
 
 
-def create_key_index(data, key_fields):
-    """基于指定键字段创建索引"""
-    index = defaultdict(list)
+def copy_csv(src_file: str, dst_file: str) -> dict:
+    """复制 CSV 文件"""
+    os.makedirs(os.path.dirname(dst_file) if os.path.dirname(dst_file) else '.', exist_ok=True)
 
-    for row in data:
-        key_parts = []
-        for field in key_fields:
-            key_parts.append(row.get(field, ''))
+    rows = []
+    fieldnames = []
+    with open(src_file, 'r', encoding='utf-8') as f:
+        reader = csv.DictReader(f)
+        fieldnames = reader.fieldnames
+        for row in reader:
+            rows.append(row)
 
-        key = '|'.join(key_parts)
-        index[key].append(row)
+    with open(dst_file, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
 
-    return index
-
-
-def join_csv_files(e2e_data, interactivity_data, key_fields):
-    """执行基于多键的join操作"""
-    print(f"🔄 Creating index for E2E data...")
-    e2e_index = create_key_index(e2e_data, key_fields)
-
-    print(f"🔄 Creating index for Interactivity data...")
-    interactivity_index = create_key_index(interactivity_data, key_fields)
-
-    print(f"📊 E2E unique keys: {len(e2e_index)}")
-    print(f"📊 Interactivity unique keys: {len(interactivity_index)}")
-
-    # 执行join操作
-    joined_data = []
-    matched_keys = 0
-    e2e_only_keys = 0
-    inter_only_keys = 0
-
-    # 首先处理E2E数据作为基础
-    for key, e2e_rows in e2e_index.items():
-        if key in interactivity_index:
-            # 找到匹配的记录
-            inter_rows = interactivity_index[key]
-
-            for e2e_row in e2e_rows:
-                for inter_row in inter_rows:
-                    # 创建合并后的行
-                    joined_row = e2e_row.copy()
-
-                    # 重命名E2E的x和y字段
-                    if 'x' in e2e_row:
-                        joined_row['e2e_x'] = e2e_row['x']
-                        del joined_row['x']
-
-                    if 'y' in e2e_row:
-                        joined_row['e2e_y'] = e2e_row['y']
-                        del joined_row['y']
-
-                    # 添加Interactivity的x和y字段
-                    if 'x' in inter_row:
-                        joined_row['inter_x'] = inter_row['x']
-
-                    if 'y' in inter_row:
-                        joined_row['inter_y'] = inter_row['y']
-
-                    joined_data.append(joined_row)
-
-            matched_keys += 1
-        else:
-            # E2E独有的记录
-            for e2e_row in e2e_rows:
-                joined_row = e2e_row.copy()
-
-                if 'x' in e2e_row:
-                    joined_row['e2e_x'] = e2e_row['x']
-                    del joined_row['x']
-
-                if 'y' in e2e_row:
-                    joined_row['e2e_y'] = e2e_row['y']
-                    del joined_row['y']
-
-                joined_row['inter_x'] = ''
-                joined_row['inter_y'] = ''
-
-                joined_data.append(joined_row)
-
-            e2e_only_keys += 1
-
-    # 处理Interactivity独有的记录
-    for key, inter_rows in interactivity_index.items():
-        if key not in e2e_index:
-            for inter_row in inter_rows:
-                joined_row = {}
-
-                for field in inter_row:
-                    if field in ['x', 'y']:
-                        continue
-                    joined_row[field] = inter_row[field]
-
-                joined_row['e2e_x'] = ''
-                joined_row['e2e_y'] = ''
-
-                if 'x' in inter_row:
-                    joined_row['inter_x'] = inter_row['x']
-
-                if 'y' in inter_row:
-                    joined_row['inter_y'] = inter_row['y']
-
-                joined_data.append(joined_row)
-
-            inter_only_keys += 1
-
-    print(f"✅ Matched keys: {matched_keys}")
-    print(f"⚠️  E2E only keys: {e2e_only_keys}")
-    print(f"⚠️  Interactivity only keys: {inter_only_keys}")
-    print(f"📊 Total joined records: {len(joined_data)}")
-
-    return joined_data, {
-        'matched_keys': matched_keys,
-        'e2e_only_keys': e2e_only_keys,
-        'inter_only_keys': inter_only_keys,
-        'total_records': len(joined_data)
+    print(f"✅ Output saved: {dst_file} ({len(rows)} records)")
+    return {
+        'total_records': len(rows),
+        'columns': len(fieldnames),
+        'source': 'copy',
     }
 
 
-def define_output_columns(base_columns):
-    """定义输出列的顺序"""
-    exclude_columns = ['x', 'y']
-    base_cols = [col for col in base_columns if col not in exclude_columns]
+def merge_multiple_csvs(csv_files: list, output_file: str) -> dict:
+    """合并多个 CSV 文件"""
+    all_rows = []
+    all_fieldnames = []
 
-    new_columns = ['e2e_x', 'e2e_y', 'inter_x', 'inter_y']
+    for csv_file in csv_files:
+        with open(csv_file, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            if not all_fieldnames:
+                all_fieldnames = list(reader.fieldnames)
+            else:
+                for fn in reader.fieldnames:
+                    if fn not in all_fieldnames:
+                        all_fieldnames.append(fn)
+            for row in reader:
+                all_rows.append(row)
 
-    return base_cols + new_columns
+    os.makedirs(os.path.dirname(output_file) if os.path.dirname(output_file) else '.', exist_ok=True)
+    with open(output_file, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=all_fieldnames)
+        writer.writeheader()
+        writer.writerows(all_rows)
+
+    print(f"✅ Merged output saved: {output_file} ({len(all_rows)} records)")
+    return {
+        'total_records': len(all_rows),
+        'columns': len(all_fieldnames),
+        'source': 'merge',
+    }
 
 
-def save_joined_csv(data, columns, output_file):
-    """保存合并后的CSV文件"""
-    try:
-        os.makedirs(os.path.dirname(output_file) if os.path.dirname(output_file) else '.', exist_ok=True)
-        with open(output_file, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.DictWriter(f, fieldnames=columns)
-            writer.writeheader()
-            writer.writerows(data)
+def merge_legacy_csvs(e2e_file: str, inter_file: str, output_file: str) -> dict:
+    """合并旧版 e2e + interactivity CSV 文件（向后兼容）"""
+    # 定义合并键
+    key_fields = ['model_name', 'sequence_length', 'conc', 'hwKey', 'precision', 'tp']
 
-        print(f"✅ Joined CSV saved: {output_file}")
-        return True
-    except Exception as e:
-        print(f"❌ Error saving joined CSV: {e}")
-        return False
+    # 读取 e2e 数据
+    e2e_rows = {}
+    e2e_fieldnames = []
+    with open(e2e_file, 'r', encoding='utf-8') as f:
+        reader = csv.DictReader(f)
+        e2e_fieldnames = list(reader.fieldnames)
+        for row in reader:
+            key = tuple(row.get(k, '') for k in key_fields)
+            e2e_rows[key] = row
+
+    # 读取 interactivity 数据
+    inter_rows = {}
+    inter_fieldnames = []
+    with open(inter_file, 'r', encoding='utf-8') as f:
+        reader = csv.DictReader(f)
+        inter_fieldnames = list(reader.fieldnames)
+        for row in reader:
+            key = tuple(row.get(k, '') for k in key_fields)
+            inter_rows[key] = row
+
+    # 确定输出列
+    e2e_data_cols = [c for c in e2e_fieldnames if c not in key_fields and c not in ['model_name', 'sequence_length']]
+    inter_data_cols = [c for c in inter_fieldnames if c not in key_fields and c not in ['model_name', 'sequence_length']]
+
+    output_columns = key_fields[:]
+    for col in e2e_data_cols:
+        output_columns.append(f"e2e_{col}")
+    for col in inter_data_cols:
+        output_columns.append(f"inter_{col}")
+
+    # 合并
+    all_keys = set(e2e_rows.keys()) | set(inter_rows.keys())
+    merged_rows = []
+
+    for key in sorted(all_keys):
+        merged_row = {}
+        e2e_row = e2e_rows.get(key, {})
+        inter_row = inter_rows.get(key, {})
+
+        for i, k in enumerate(key_fields):
+            merged_row[k] = key[i]
+
+        for col in e2e_data_cols:
+            merged_row[f"e2e_{col}"] = e2e_row.get(col, '')
+        for col in inter_data_cols:
+            merged_row[f"inter_{col}"] = inter_row.get(col, '')
+
+        merged_rows.append(merged_row)
+
+    # 保存
+    os.makedirs(os.path.dirname(output_file) if os.path.dirname(output_file) else '.', exist_ok=True)
+    with open(output_file, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=output_columns)
+        writer.writeheader()
+        writer.writerows(merged_rows)
+
+    print(f"✅ Merged output saved: {output_file} ({len(merged_rows)} records)")
+    return {
+        'total_records': len(merged_rows),
+        'columns': len(output_columns),
+        'source': 'legacy_merge',
+    }
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description='合并 InferenceX E2E 和 Interactivity CSV 文件'
+        description='合并 InferenceX CSV 数据文件'
     )
     parser.add_argument(
         '--input-dir', '-i',
@@ -182,66 +198,29 @@ def main():
         help='输入 CSV 文件目录 (默认: json_data)'
     )
     parser.add_argument(
-        '--output-dir', '-o',
-        default='json_data',
-        help='输出合并 CSV 文件目录 (默认: json_data)'
+        '--output', '-o',
+        default='json_data/inference_max_merged.csv',
+        help='输出合并后的 CSV 文件路径 (默认: json_data/inference_max_merged.csv)'
     )
 
     args = parser.parse_args()
 
-    e2e_file = os.path.join(args.input_dir, 'inference_max_e2e.csv')
-    interactivity_file = os.path.join(args.input_dir, 'inference_max_interactivity.csv')
-    output_file = os.path.join(args.output_dir, 'inference_max_merged.csv')
-
-    # 定义join的键字段
-    key_fields = ['model_name', 'sequence_length', 'conc', 'hwKey', 'precision', 'tp']
-
-    print("🚀 Starting CSV file merge operation...")
-
-    # 检查输入文件
-    if not os.path.exists(e2e_file):
-        print(f"❌ E2E file not found: {e2e_file}")
+    if not os.path.exists(args.input_dir):
+        print(f"❌ Input directory {args.input_dir} does not exist")
         return
 
-    if not os.path.exists(interactivity_file):
-        print(f"❌ Interactivity file not found: {interactivity_file}")
-        return
+    print("🚀 Starting CSV merge...")
+    result = merge_or_copy_csv(args.input_dir, args.output)
 
-    # 读取CSV文件
-    print(f"📖 Reading E2E file: {e2e_file}")
-    e2e_data = read_csv_file(e2e_file)
-    print(f"   Loaded {len(e2e_data)} records")
-
-    print(f"📖 Reading Interactivity file: {interactivity_file}")
-    interactivity_data = read_csv_file(interactivity_file)
-    print(f"   Loaded {len(interactivity_data)} records")
-
-    # 执行join操作
-    print(f"\n🔄 Joining files on keys: {', '.join(key_fields)}")
-    joined_data, stats = join_csv_files(e2e_data, interactivity_data, key_fields)
-
-    if not joined_data:
-        print("❌ No data to save")
-        return
-
-    # 定义输出列
-    base_columns = e2e_data[0].keys() if e2e_data else []
-    output_columns = define_output_columns(base_columns)
-
-    print(f"📋 Output columns: {len(output_columns)}")
-
-    # 保存合并后的文件
-    if save_joined_csv(joined_data, output_columns, output_file):
-        file_size = os.path.getsize(output_file)
-        print(f"\n🎉 CSV merge completed successfully!")
-        print(f"📄 Output file: {output_file}")
-        print(f"📊 File size: {file_size:,} bytes ({file_size/1024/1024:.2f} MB)")
-        print(f"📈 Total records: {len(joined_data):,}")
-        print(f"📋 Columns: {len(output_columns)}")
-
-        total_keys = stats['matched_keys'] + stats['e2e_only_keys'] + stats['inter_only_keys']
-        if total_keys > 0:
-            print(f"📊 Match rate: {(stats['matched_keys'] / total_keys * 100):.1f}%")
+    if result:
+        file_size = os.path.getsize(args.output)
+        print(f"\n🎉 Merge completed!")
+        print(f"📄 Output: {args.output}")
+        print(f"📊 Size: {file_size:,} bytes ({file_size/1024/1024:.2f} MB)")
+        print(f"📈 Records: {result['total_records']:,}")
+        print(f"📋 Columns: {result['columns']}")
+    else:
+        print("❌ Merge failed!")
 
 
 if __name__ == "__main__":

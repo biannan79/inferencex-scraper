@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-InferenceX 一键全流程脚本 - 采集 → 转换 → 合并
+InferenceX 一键全流程脚本 v3 - 采集 → 转换 → 合并
 
 依次执行：
-  1. scrape_inferencex.py — 从 Vercel Blob Storage 采集 JSON 数据
-  2. convert_to_csv.py   — 将 JSON 按类型转换为 E2E 和 Interactivity CSV
-  3. merge_csv.py         — 合并两个 CSV 为最终的 merged.csv
+  1. scrape_inferencex.py — 从 /api/v1/benchmarks 采集 JSON 数据
+  2. convert_to_csv.py   — 将 JSON 转换为 CSV
+  3. merge_csv.py         — 合并为最终的 merged.csv
 """
 
 import os
@@ -19,12 +19,15 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
 
 from scrape_inferencex import scrape_api_data, DEFAULT_MODELS, DEFAULT_SEQUENCES
-from convert_to_csv import process_json_files_by_type, convert_files_to_csv
-from merge_csv import read_csv_file, join_csv_files, define_output_columns, save_joined_csv
+from convert_to_csv import convert_files_to_csv
+from merge_csv import merge_or_copy_csv
+
+import glob
 
 
 def run_pipeline(models=None, sequences=None, output_base='json_data',
-                 scrape_only=False, convert_only=False, timeout=120):
+                 scrape_only=False, convert_only=False, timeout=120,
+                 date=None):
     """
     执行完整的数据采集和处理管道
 
@@ -35,32 +38,34 @@ def run_pipeline(models=None, sequences=None, output_base='json_data',
         scrape_only: 仅执行采集步骤
         convert_only: 仅执行转换和合并步骤
         timeout: 请求超时时间
+        date: 指定采集日期（None=最新）
     """
     models = models or DEFAULT_MODELS
     sequences = sequences or DEFAULT_SEQUENCES
 
     raw_dir = os.path.join(output_base, 'raw_json_files')
-    e2e_csv = os.path.join(output_base, 'inference_max_e2e.csv')
-    inter_csv = os.path.join(output_base, 'inference_max_interactivity.csv')
+    benchmarks_csv = os.path.join(output_base, 'inference_max_benchmarks.csv')
     merged_csv = os.path.join(output_base, 'inference_max_merged.csv')
 
     pipeline_start = time.time()
     print("=" * 80)
-    print(f"🚀 InferenceX Data Pipeline - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"🚀 InferenceX Data Pipeline v3 - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 80)
     print(f"📋 Models: {len(models)}")
     print(f"📋 Sequences: {len(sequences)}")
     print(f"📁 Output base: {output_base}")
+    if date:
+        print(f"📅 Target date: {date}")
     print()
 
     # ─── 步骤 1: 数据采集 ───────────────────────────────────────────────────
     if not convert_only:
         print("━" * 80)
-        print("📥 STEP 1/3: Data Collection")
+        print("📥 STEP 1/3: Data Collection (API v1)")
         print("━" * 80)
 
         step_start = time.time()
-        scrape_results = scrape_api_data(models, sequences, raw_dir, timeout)
+        scrape_results = scrape_api_data(models, sequences, raw_dir, timeout, date)
         step_elapsed = time.time() - step_start
 
         total_files = scrape_results.get('total_files', 0)
@@ -83,72 +88,62 @@ def run_pipeline(models=None, sequences=None, output_base='json_data',
 
     step_start = time.time()
 
-    interactivity_files, e2e_files = process_json_files_by_type(raw_dir)
+    # 查找所有 JSON 文件
+    json_files = glob.glob(os.path.join(raw_dir, '*.json'))
+    json_files = [f for f in json_files if not any(x in os.path.basename(f).lower()
+                                                for x in ['readme', 'summary', 'cleanup', 'report'])]
 
-    interactivity_result = None
-    if interactivity_files:
-        interactivity_result = convert_files_to_csv(interactivity_files, 'interactivity', inter_csv)
-
-    e2e_result = None
-    if e2e_files:
-        e2e_result = convert_files_to_csv(e2e_files, 'e2e', e2e_csv)
+    csv_result = None
+    if json_files:
+        csv_result = convert_files_to_csv(json_files, benchmarks_csv)
+    else:
+        print("❌ No JSON files found for conversion")
 
     step_elapsed = time.time() - step_start
 
-    if not interactivity_result and not e2e_result:
+    if not csv_result:
         print("❌ No data was converted, aborting pipeline!")
         return False
 
-    inter_records = interactivity_result['total_records'] if interactivity_result else 0
-    e2e_records = e2e_result['total_records'] if e2e_result else 0
-    print(f"\n⏱️  Step 2 took {step_elapsed:.1f}s — E2E: {e2e_records} records, Inter: {inter_records} records")
+    print(f"\n⏱️  Step 2 took {step_elapsed:.1f}s — {csv_result['total_records']} records")
 
     # ─── 步骤 3: CSV 合并 ─────────────────────────────────────────────────────
     print("\n" + "━" * 80)
-    print("🔗 STEP 3/3: CSV Merge (E2E + Interactivity)")
+    print("🔗 STEP 3/3: CSV Finalize")
     print("━" * 80)
 
     step_start = time.time()
 
-    if not os.path.exists(e2e_csv) or not os.path.exists(inter_csv):
-        print("❌ One or both CSV files missing, skipping merge")
-        return False
-
-    e2e_data = read_csv_file(e2e_csv)
-    interactivity_data = read_csv_file(inter_csv)
-
-    key_fields = ['model_name', 'sequence_length', 'conc', 'hwKey', 'precision', 'tp']
-    joined_data, stats = join_csv_files(e2e_data, interactivity_data, key_fields)
-
-    if joined_data:
-        base_columns = e2e_data[0].keys() if e2e_data else []
-        output_columns = define_output_columns(base_columns)
-        save_joined_csv(joined_data, output_columns, merged_csv)
+    merge_result = merge_or_copy_csv(output_base, merged_csv)
 
     step_elapsed = time.time() - step_start
-    print(f"\n⏱️  Step 3 took {step_elapsed:.1f}s — {len(joined_data)} merged records")
+
+    if merge_result:
+        print(f"\n⏱️  Step 3 took {step_elapsed:.1f}s — {merge_result['total_records']} records")
+    else:
+        print(f"\n⏱️  Step 3 took {step_elapsed:.1f}s — merge skipped")
 
     # ─── 总结 ────────────────────────────────────────────────────────────────
     total_elapsed = time.time() - pipeline_start
     print("\n" + "=" * 80)
     print(f"🎉 Pipeline Complete! Total time: {total_elapsed:.1f}s")
     print("=" * 80)
-    print(f"📄 E2E CSV:          {e2e_csv}")
-    print(f"📄 Interactivity CSV: {inter_csv}")
-    print(f"📄 Merged CSV:       {merged_csv}")
+    print(f"📄 Benchmarks CSV: {benchmarks_csv}")
+    print(f"📄 Merged CSV:     {merged_csv}")
 
     if os.path.exists(merged_csv):
         file_size = os.path.getsize(merged_csv)
-        print(f"📊 Merged size:      {file_size:,} bytes ({file_size/1024/1024:.2f} MB)")
+        print(f"📊 Merged size:    {file_size:,} bytes ({file_size/1024/1024:.2f} MB)")
 
-    print(f"📈 Total records:    {len(joined_data):,}")
+    if merge_result:
+        print(f"📈 Total records:  {merge_result['total_records']:,}")
 
     return True
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description='InferenceX 一键数据采集与处理管道'
+        description='InferenceX 一键数据采集与处理管道 v3'
     )
     parser.add_argument(
         '--output-base', '-o',
@@ -164,6 +159,11 @@ def main():
         '--sequences', '-s',
         default=None,
         help='逗号分隔的序列列表'
+    )
+    parser.add_argument(
+        '--date', '-d',
+        default=None,
+        help='指定采集日期 (如 2025-10-29)，不指定则采集最新数据'
     )
     parser.add_argument(
         '--scrape-only',
@@ -193,6 +193,7 @@ def main():
         scrape_only=args.scrape_only,
         convert_only=args.convert_only,
         timeout=args.timeout,
+        date=args.date,
     )
 
     exit(0 if success else 1)
