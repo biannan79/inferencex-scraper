@@ -3,7 +3,7 @@
 OpenRouter批量模型详细数据获取脚本
 
 基于 `openrouter_models_providers.xlsx` 文件的"所有模型"工作表的"slug"列，
-使用 `get_1model_detals.py` 中的方法，批量获取所有模型的详细数据。
+使用 `get_1model_details.py` 中的方法，批量获取所有模型的详细数据。
 
 功能特点：
 1. 从Excel读取模型slug列表
@@ -53,7 +53,7 @@ except ImportError:
     sys.exit(1)
 
 # 从现有脚本导入解析函数
-from get_1model_detals import (
+from get_1model_details import (
     parse_top_apps_json,
     parse_author_models,
     parse_endpoint_stats,

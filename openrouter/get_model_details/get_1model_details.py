@@ -41,6 +41,11 @@ OpenRouter Minimax Apps API爬虫 - 使用Scrapling库获取API数据并保存�
    返回：模型在Design Arena上的基准评分
    解析结果：design_arena_benchmarks (Design Arena基准评分)
 
+8. Benchmarks页面 (DOM抓取)
+   URL: https://openrouter.ai/{model_slug}/benchmarks
+   返回：Design Arena详细benchmark数据（Category Performance, Models Arena, Agents Arena, Ranking Distribution）
+   解析结果：benchmarks_category_performance, benchmarks_models_arena, benchmarks_agents_arena, benchmarks_ranking_distribution
+
 本脚本自动获取上述所有API数据，使用extract.py中的解析函数处理后，
 生成包含多个工作表的Excel文件。
 """
@@ -51,6 +56,7 @@ import json
 import time
 import glob
 import tempfile
+import re
 import pandas as pd
 from datetime import datetime
 from urllib.parse import urlparse
@@ -75,6 +81,7 @@ EXTRACT_AVAILABLE = True
 
 # 配置参数
 SAVE_RAW_RESPONSE = False  # 是否保存原始API响应文件
+SAVE_BENCHMARKS_HTML = False  # 是否保存benchmarks页面的HTML（用于调试）
 
 
 def fetch_api_data(url, description="API数据"):
@@ -664,10 +671,10 @@ def main():
         result = fetch_api_data(api_url, description)
 
         if result["success"]:
-            print(f"  ✓ {description}获取成功")
+            print(f"  [OK] {description}获取成功")
             api_results[api_name] = result
         else:
-            print(f"  ✗ {description}获取失败: {result.get('error', '未知错误')}")
+            print(f"  [FAIL] {description}获取失败: {result.get('error', '未知错误')}")
             # 如果核心API失败，继续执行但会跳过后续解析
 
     print(f"\nAPI数据获取完成: {len([r for r in api_results.values() if r['success']])}个成功, {len([r for r in api_results.values() if not r['success']])}个失败")
@@ -782,14 +789,49 @@ def main():
     print()
 
     # 4. 创建Excel文件
-    print("步骤4: 创建包含多个工作表的Excel文件")
+    print("\n步骤4: 创建包含多个工作表的Excel文件")
     print("-" * 40)
 
-    # 生成输出文件名
+    # 4.1 先抓取 Benchmarks 页面（在创建 Excel 之前）
+    print("\n步骤4.1: 抓取 Benchmarks 页面 (DOM)")
+    print("-" * 40)
+
+    # 从 API 端点提取 model_slug
+    model_slug = None
+    for api_url in api_endpoints.values():
+        if 'permaslug=' in api_url or 'slug=' in api_url:
+            # 提取 slug 参数
+            import urllib.parse
+            parsed = urllib.parse.urlparse(api_url)
+            params = urllib.parse.parse_qs(parsed.query)
+            if 'permaslug' in params:
+                model_slug = params['permaslug'][0]
+            elif 'slug' in params:
+                model_slug = params['slug'][0]
+            if model_slug:
+                break
+
+    if model_slug:
+        print(f"目标模型: {model_slug}")
+        benchmarks_result = fetch_benchmarks_page(model_slug)
+
+        if benchmarks_result["success"]:
+            benchmarks_data = benchmarks_result["data"]
+            benchmarks_dfs = parse_benchmarks_to_dataframes(benchmarks_data)
+
+            # 添加到 dataframes
+            dataframes.update(benchmarks_dfs)
+            print(f"  Benchmarks 数据获取成功，共 {len(benchmarks_dfs)} 个工作表")
+        else:
+            print(f"  Benchmarks 数据获取失败: {benchmarks_result.get('error', '未知错误')}")
+    else:
+        print("  警告: 无法从API端点提取模型标识，跳过 Benchmarks 页面抓取")
+
+    # 4.2 生成输出文件名
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_excel = f"openrouter_api_data_{timestamp}.xlsx"
 
-    print(f"输出文件: {output_excel}")
+    print(f"\n输出文件: {output_excel}")
     print("工作表:")
 
     # 创建API信息DataFrame（作为Excel文件的首页）
@@ -875,6 +917,25 @@ def main():
     print(f"API接口信息: {len(api_info_df)} 个API")
     for _, row in api_info_df.iterrows():
         print(f"  {row['API名称']}: 获取{row['获取状态']}, 解析{row['解析状态']}, 工作表: {row['生成的工作表']}")
+
+    # 添加 Benchmarks 数据到 API 信息
+    for sheet_name in dataframes.keys():
+        if sheet_name.startswith("benchmarks_"):
+            df = dataframes[sheet_name]
+            api_info_rows.append({
+                "API名称": sheet_name,
+                "API URL": f"https://openrouter.ai/{model_slug}/benchmarks" if model_slug else "",
+                "描述": f"Design Arena {sheet_name.replace('benchmarks_', '').replace('_', ' ').title()}",
+                "获取状态": "成功",
+                "解析状态": "成功",
+                "解析函数": "DOM抓取",
+                "数据行数": len(df),
+                "数据列数": len(df.columns),
+                "生成的工作表": sheet_name
+            })
+
+    # 更新 API 信息 DataFrame
+    api_info_df = pd.DataFrame(api_info_rows)
 
     # 创建Excel文件（包含API信息工作表）
     excel_path = create_excel_with_sheets(dataframes, output_excel, api_info_df)
@@ -1214,6 +1275,197 @@ def parse_design_arena_benchmark(file_path: str):
         return pd.DataFrame(data)
     else:
         return pd.DataFrame([data])
+
+
+# ============================================================================
+# Benchmarks 页面 DOM 抓取函数
+# ============================================================================
+
+def fetch_benchmarks_page(model_slug):
+    """
+    使用 DynamicFetcher 抓取 benchmarks 页面
+
+    参数:
+        model_slug: 模型标识，如 "minimax/minimax-m2.7-20260318"
+
+    返回:
+        dict: {"success": bool, "data": dict, "html": str, "error": str}
+    """
+    url = f"https://openrouter.ai/{model_slug}/benchmarks"
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] 开始抓取 Benchmarks 页面: {url}")
+
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+    }
+
+    try:
+        start_time = time.time()
+        # 关键: 使用 DynamicFetcher 才能获取完整数据
+        page = DynamicFetcher.fetch(
+            url,
+            headers=headers,
+            headless=True,
+            network_idle=True
+        )
+        elapsed = time.time() - start_time
+        print(f"  页面加载完成，耗时: {elapsed:.2f}秒")
+
+        # 获取 HTML 内容
+        html_content = None
+        if hasattr(page, 'body'):
+            body = page.body
+            if isinstance(body, bytes):
+                html_content = body.decode('utf-8', errors='ignore')
+            else:
+                html_content = str(body)
+
+        if not html_content:
+            return {"success": False, "data": None, "html": None, "error": "无法获取页面内容"}
+
+        print(f"  HTML 大小: {len(html_content):,} 字符")
+
+        # 保存 HTML 用于调试
+        if SAVE_BENCHMARKS_HTML:
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            html_file = f"benchmarks_debug_{model_slug.replace('/', '_')}_{timestamp}.html"
+            with open(html_file, 'w', encoding='utf-8') as f:
+                f.write(html_content)
+            print(f"  HTML 已保存: {html_file}")
+
+        # 提取 benchmark 数据
+        data = extract_benchmarks_from_html(html_content)
+
+        if data:
+            print(f"  成功提取 benchmark 数据")
+            return {"success": True, "data": data, "html": html_content, "error": None}
+        else:
+            return {"success": False, "data": None, "html": html_content, "error": "未能提取到 benchmark 数据"}
+
+    except Exception as e:
+        print(f"  抓取失败: {e}")
+        import traceback
+        traceback.print_exc()
+        return {"success": False, "data": None, "html": None, "error": str(e)}
+
+
+def extract_benchmarks_from_html(html_content):
+    """
+    从 HTML 内容中提取 Design Arena benchmark 数据
+    """
+    result = {
+        "category_performance": [],
+        "models_arena": [],
+        "agents_arena": [],
+        "ranking_distribution": []
+    }
+
+    # 1. 提取 Category Performance (雷达图数据)
+    category_pattern = r'fill-foreground text-xs font-medium">([^<]+)</text>.*?fill-muted-foreground text-2xs">Elo:\s*(\d+)</text>'
+    category_matches = re.findall(category_pattern, html_content, re.DOTALL)
+
+    for match in category_matches:
+        result["category_performance"].append({
+            "category": match[0].strip(),
+            "elo": int(match[1])
+        })
+
+    # 2. 提取 Models Arena 数据
+    models_section_match = re.search(
+        r'<h3[^>]*>Models Arena</h3>(.*?)(?:<h3[^>]*>Agents Arena</h3>|<div class="pt-4")',
+        html_content,
+        re.DOTALL
+    )
+
+    if models_section_match:
+        models_html = models_section_match.group(1)
+        card_pattern = r'<span class="text-sm font-medium">([^<]+)</span>.*?<span[^>]*class="[^"]*whitespace-nowrap[^"]*"[^>]*>([^<]+)</span>.*?<span class="text-3xl font-bold tabular-nums">(\d+)</span>.*?style="width:\s*([\d.]+)%.*?<span>([\d.]+)%\s*Win</span>.*?<span[^>]*>·</span>.*?<span>([\d.]+)s\s*Avg</span>.*?<span[^>]*>·</span>.*?<span>Top\s*([\d.]+)%</span>'
+
+        card_matches = re.findall(card_pattern, models_html, re.DOTALL)
+
+        for match in card_matches:
+            result["models_arena"].append({
+                "category": match[0].strip(),
+                "rank_badge": match[1].strip(),
+                "elo": int(match[2]),
+                "progress_percent": float(match[3]),
+                "win_rate": float(match[4]),
+                "avg_time_seconds": float(match[5]) if match[5] else None,
+                "top_percent": match[6].strip()
+            })
+
+    # 3. 提取 Agents Arena 数据
+    agents_section_match = re.search(
+        r'<h3[^>]*>Agents Arena</h3>(.*?)(?:<div class="pt-4"|</div>\s*</div>\s*<div)',
+        html_content,
+        re.DOTALL
+    )
+
+    if agents_section_match:
+        agents_html = agents_section_match.group(1)
+        card_pattern = r'<span class="text-sm font-medium">([^<]+)</span>.*?<span[^>]*class="[^"]*whitespace-nowrap[^"]*"[^>]*>([^<]+)</span>.*?<span class="text-3xl font-bold tabular-nums">(\d+)</span>.*?style="width:\s*([\d.]+)%.*?<span>([\d.]+)%\s*Win</span>.*?<span[^>]*>·</span>.*?<span>Top\s*([\d.]+)%</span>'
+
+        card_matches = re.findall(card_pattern, agents_html, re.DOTALL)
+
+        for match in card_matches:
+            result["agents_arena"].append({
+                "category": match[0].strip(),
+                "rank_badge": match[1].strip(),
+                "elo": int(match[2]),
+                "progress_percent": float(match[3]),
+                "win_rate": float(match[4]),
+                "top_percent": match[5].strip()
+            })
+
+    # 4. 提取 Ranking Distribution
+    ranking_section = re.search(
+        r'<span class="text-sm font-medium">Ranking Distribution</span>(.*?)(?:<div class="flex flex-col gap-3 rounded-lg border|<div class="grid)',
+        html_content,
+        re.DOTALL
+    )
+
+    if ranking_section:
+        ranking_html = ranking_section.group(1)
+        tspan_pattern = r'<tspan[^>]*>(\d+)</tspan>'
+        values = re.findall(tspan_pattern, ranking_html)
+
+        labels = ['First', 'Second', 'Third', 'Fourth']
+        for i, label in enumerate(labels):
+            if i < len(values):
+                result["ranking_distribution"].append({
+                    "rank": label,
+                    "count": int(values[i])
+                })
+
+    # 检查是否有数据
+    total_items = sum(len(result[k]) for k in result)
+
+    if total_items == 0:
+        return None
+
+    return result
+
+
+def parse_benchmarks_to_dataframes(benchmarks_data):
+    """
+    将 benchmark 数据转换为 DataFrame
+    """
+    dataframes = {}
+
+    if benchmarks_data.get("category_performance"):
+        dataframes["benchmarks_category_performance"] = pd.DataFrame(benchmarks_data["category_performance"])
+
+    if benchmarks_data.get("models_arena"):
+        dataframes["benchmarks_models_arena"] = pd.DataFrame(benchmarks_data["models_arena"])
+
+    if benchmarks_data.get("agents_arena"):
+        dataframes["benchmarks_agents_arena"] = pd.DataFrame(benchmarks_data["agents_arena"])
+
+    if benchmarks_data.get("ranking_distribution"):
+        dataframes["benchmarks_ranking_distribution"] = pd.DataFrame(benchmarks_data["ranking_distribution"])
+
+    return dataframes
 
 
 if __name__ == "__main__":
